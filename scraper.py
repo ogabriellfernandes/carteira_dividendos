@@ -272,7 +272,21 @@ def _buscar_cotacao_usd_brl(sessao: requests.Session) -> Optional[float]:
         return None
 
 
-def obter_cotacao_dolar(cotacao_existente: Optional[float] = None) -> Optional[float]:
+def obter_cotacao_dolar(cotacao_existente: float | None = None) -> float | None:
+    if cotacao_existente is not None:
+        return cotacao_existente
+
+    try:
+        resp = requests.get(
+            "https://api.frankfurter.app/latest?from=USD&to=BRL",
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return float(resp.json()["rates"]["BRL"])
+    except Exception as e:
+        log.error("Falha ao buscar cotação USD/BRL: %s", e)
+        return None
+
     """
     Wrapper público de cotação USD -> BRL.
     Se `cotacao_existente` for fornecida (já obtida em outro ponto do fluxo,
