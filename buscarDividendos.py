@@ -1,4 +1,14 @@
+"""
+buscarDividendos.py
+Orquestra: leitura de carteira -> scraping de proventos -> diff contra
+lançamentos existentes -> atualização/inserção no Google Sheets.
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Optional
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -14,8 +24,63 @@ from config import (
 )
 from scraper import buscar_proventos, normalizar_data
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger(__name__)
 
-def normalizar_valor(valor_str: str) -> float | None:
+# ===================== CONSTANTES =====================
+LINHA_INICIAL_LANCAMENTOS = 5
+COLUNA_VALOR = "D"
+COLUNA_VALOR_USD = "O"
+COLUNAS_ESCRITA = "A:F"  # data_com, data_pagamento, ativo, valor, descricao, tipo
+
+
+@dataclass
+class Provento:
+    """Representa um provento normalizado, com tipagem explícita."""
+    data_com: str
+    data_pagamento: str
+    ativo: str
+    valor: str
+    descricao: str
+    tipo: str
+    valor_usd: Optional[float] = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Provento":
+        return cls(
+            data_com=normalizar_data(d.get("data_com", "")) or d.get("data_com", ""),
+            data_pagamento=normalizar_data(d.get("data_pagamento", "")) or d.get("data_pagamento", ""),
+            ativo=d.get("ativo", "").strip().upper(),
+            valor=d.get("valor", ""),
+            descricao=d.get("descricao", "").strip(),
+            tipo=d.get("tipo", "").strip(),
+            valor_usd=d.get("valor_usd"),
+        )
+
+    @property
+    def chave(self) -> tuple:
+        return (self.data_com, self.data_pagamento, self.ativo, self.descricao, self.tipo)
+
+    @property
+    def valor_float(self) -> Optional[float]:
+        return normalizar_valor(self.valor)
+
+
+@dataclass
+class Atualizacao:
+    linha: int
+    ativo: str
+    valor_antigo: str
+    valor_novo: Optional[float]
+    valor_usd: Optional[float] = None
+
+
+def normalizar_valor(valor_str: str | None) -> Optional[float]:
+    if not valor_str:
+        return None
     valor_limpo = valor_str.replace("R$", "").strip().replace(",", ".")
     try:
         return round(float(valor_limpo), 4)
@@ -24,439 +89,193 @@ def normalizar_valor(valor_str: str) -> float | None:
 
 
 def _formatar_data_celula(valor) -> str:
-    """
-    Normaliza uma data lida da planilha para dd/mm/yyyy,
-    aceitando tanto string quanto datetime/date do Sheets.
-    """
-    if valor is None:
+    if not valor:
         return ""
-
     valor_str = str(valor).strip()
     if not valor_str:
         return ""
-
-    normalizado = normalizar_data(valor_str)
-    return normalizado or valor_str  # fallback: mantém original se não reconhecer
+    return normalizar_data(valor_str) or valor_str
 
 
-def ler_tickers(service):
+def ler_tickers(service) -> list[str]:
     result = service.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=CARTEIRA_RANGE
+        spreadsheetId=SPREADSHEET_ID, range=CARTEIRA_RANGE
     ).execute()
     valores = result.get("values", [])
 
-    tickers = []
-    for linha in valores:
-        if not linha:
-            continue
-        ticker = linha[0].strip().upper()
-        if ticker and ticker not in TICKERS_IGNORADOS:
-            tickers.append(ticker)
-
-    return tickers
+    return [
+        linha[0].strip().upper()
+        for linha in valores
+        if linha and linha[0].strip().upper() not in TICKERS_IGNORADOS and linha[0].strip()
+    ]
 
 
-def ler_lancamentos_existentes(service):
-    """
-    Lê os lançamentos já existentes e retorna:
-    dict { chave_normalizada: {"linha": int, "valor": str} }
-    """
+def ler_lancamentos_existentes(service) -> dict[tuple, dict]:
+    """Retorna { chave: {"linha": int, "valor": str} }."""
     result = service.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=LANCAMENTOS_RANGE
+        spreadsheetId=SPREADSHEET_ID, range=LANCAMENTOS_RANGE
     ).execute()
     valores = result.get("values", [])
 
     existentes = {}
-    linha_inicial = 5  # LANCAMENTOS_RANGE começa em A5
-
     for i, linha in enumerate(valores):
-        if len(linha) >= 6:
-            data_com = _formatar_data_celula(linha[0])
-            data_pagamento = _formatar_data_celula(linha[1])
-            ativo = linha[2].strip().upper()
-            valor = linha[3]
-            descricao = linha[4].strip()
-            tipo = linha[5].strip()
+        if len(linha) < 6:
+            continue
 
-            chave = (data_com, data_pagamento, ativo, descricao, tipo)
-            numero_linha = linha_inicial + i
-
-            existentes[chave] = {"linha": numero_linha, "valor": valor}
+        chave = (
+            _formatar_data_celula(linha[0]),
+            _formatar_data_celula(linha[1]),
+            linha[2].strip().upper(),
+            linha[4].strip(),
+            linha[5].strip(),
+        )
+        existentes[chave] = {
+            "linha": LINHA_INICIAL_LANCAMENTOS + i,
+            "valor": linha[3],
+        }
 
     return existentes
 
 
-def separar_novos_e_atualizacoes(proventos, existentes):
-    """
-    Retorna:
-    - novos: proventos que não existem ainda (vão pra linha 5)
-    - atualizacoes: proventos que já existem mas o valor mudou (ex: JSCP corrigido)
-    """
-    novos = []
-    atualizacoes = []
+def separar_novos_e_atualizacoes(
+    proventos: list[Provento], existentes: dict[tuple, dict]
+) -> tuple[list[Provento], list[Atualizacao]]:
+    novos: list[Provento] = []
+    atualizacoes: list[Atualizacao] = []
 
     for p in proventos:
-        valor_normalizado = normalizar_valor(p["valor"])
+        existente = existentes.get(p.chave)
 
-        data_com = normalizar_data(p["data_com"]) or p["data_com"]
-        data_pagamento = normalizar_data(p["data_pagamento"]) or p["data_pagamento"]
-        ativo = p["ativo"].strip().upper()
-        descricao = p["descricao"].strip()
-        tipo = p["tipo"].strip()
-
-        chave = (data_com, data_pagamento, ativo, descricao, tipo)
-
-        if chave in existentes:
-            valor_existente = existentes[chave]["valor"]
-            if valor_existente != valor_normalizado:
-                atualizacoes.append({
-                    "linha": existentes[chave]["linha"],
-                    "valor_novo": valor_normalizado,
-                    "ativo": ativo,
-                    "valor_antigo": valor_existente
-                })
-        else:
+        if existente is None:
             novos.append(p)
+            continue
+
+        valor_novo = p.valor_float
+        if existente["valor"] != valor_novo:
+            atualizacoes.append(Atualizacao(
+                linha=existente["linha"],
+                ativo=p.ativo,
+                valor_antigo=existente["valor"],
+                valor_novo=valor_novo,
+                valor_usd=p.valor_usd,
+            ))
 
     return novos, atualizacoes
 
 
-def separar_novos_e_atualizacoes(proventos, existentes):
-    novos = []
-    atualizacoes = []
-
-    for p in proventos:
-        valor_normalizado = normalizar_valor(p["valor"])
-
-        data_com = normalizar_data(p["data_com"]) or p["data_com"]
-        data_pagamento = normalizar_data(p["data_pagamento"]) or p["data_pagamento"]
-        ativo = p["ativo"].strip().upper()
-        descricao = p["descricao"].strip()
-        tipo = p["tipo"].strip()
-
-        chave = (data_com, data_pagamento, ativo, descricao, tipo)
-
-        if chave in existentes:
-            valor_existente = existentes[chave]["valor"]
-            if valor_existente != valor_normalizado:
-                atualizacoes.append({
-                    "linha": existentes[chave]["linha"],
-                    "valor_novo": valor_normalizado,
-                    "ativo": ativo,
-                    "valor_antigo": valor_existente,
-                    "valor_usd": p.get("valor_usd"),  # 👈 novo
-                })
-        else:
-            novos.append(p)
-
-    return novos, atualizacoes
+def _monta_range_usd(linha: int) -> dict:
+    return {"range": f"{NOME_ABA_LANCAMENTOS}!{COLUNA_VALOR_USD}{linha}", "values": [[None]]}
 
 
-def aplicar_atualizacoes(service, atualizacoes):
+def aplicar_atualizacoes(service, atualizacoes: list[Atualizacao]) -> None:
+    """Atualiza valor (coluna D) e, quando houver, valor em dólar (coluna O)."""
     if not atualizacoes:
-        print("Nenhum provento existente precisou de atualização de valor.")
+        log.info("Nenhum provento existente precisou de atualização de valor.")
         return
 
     dados_batch = []
+    qtd_usd = 0
+
     for att in atualizacoes:
-        linha = att["linha"]
         dados_batch.append({
-            "range": f"{NOME_ABA_LANCAMENTOS}!D{linha}",
-            "values": [[att["valor_novo"]]]
+            "range": f"{NOME_ABA_LANCAMENTOS}!{COLUNA_VALOR}{att.linha}",
+            "values": [[att.valor_novo]],
         })
 
-        if att.get("valor_usd") is not None:  # 👈 novo
+        if att.valor_usd is not None:
             dados_batch.append({
-                "range": f"{NOME_ABA_LANCAMENTOS}!O{linha}",
-                "values": [[round(att["valor_usd"], 6)]]
+                "range": f"{NOME_ABA_LANCAMENTOS}!{COLUNA_VALOR_USD}{att.linha}",
+                "values": [[round(att.valor_usd, 6)]],
             })
+            qtd_usd += 1
 
-        print(
-            f"ATUALIZADO: {att['ativo']} linha {linha} "
-            f"-> {att['valor_antigo']} => {att['valor_novo']}"
+        log.info(
+            "ATUALIZADO: %s linha %d -> %s => %s",
+            att.ativo, att.linha, att.valor_antigo, att.valor_novo,
         )
-
-    body = {
-        "valueInputOption": "USER_ENTERED",
-        "data": dados_batch
-    }
 
     service.spreadsheets().values().batchUpdate(
         spreadsheetId=SPREADSHEET_ID,
-        body=body
+        body={"valueInputOption": "USER_ENTERED", "data": dados_batch},
     ).execute()
 
-    print(f"{len(atualizacoes)} provento(s) atualizado(s) por mudança de valor.")
-
-    """Atualiza o valor (coluna D) de proventos já lançados que sofreram correção."""
-    if not atualizacoes:
-        print("Nenhum provento existente precisou de atualização de valor.")
-        return
-
-    dados_batch = []
-    for att in atualizacoes:
-        linha = att["linha"]
-        dados_batch.append({
-            "range": f"{NOME_ABA_LANCAMENTOS}!D{linha}",
-            "values": [[att["valor_novo"]]]
-        })
-        print(
-            f"ATUALIZADO: {att['ativo']} linha {linha} "
-            f"-> {att['valor_antigo']} => {att['valor_novo']}"
-        )
-
-    body = {
-        "valueInputOption": "USER_ENTERED",
-        "data": dados_batch
-    }
-
-    service.spreadsheets().values().batchUpdate(
-        spreadsheetId=SPREADSHEET_ID,
-        body=body
-    ).execute()
-
-    print(f"{len(atualizacoes)} provento(s) atualizado(s) por mudança de valor.")
+    log.info("%d provento(s) atualizado(s) por mudança de valor.", len(atualizacoes))
+    if qtd_usd:
+        log.info("%d valor(es) em dólar atualizado(s) na coluna %s.", qtd_usd, COLUNA_VALOR_USD)
 
 
-def carregar_datas_compra(service):
-    result = service.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=MOVIMENTACAO_RANGE
-    ).execute()
-    linhas = result.get("values", [])
-
-    datas_compra = {}
-
-    for linha in linhas:
-        if len(linha) < 3:
-            continue
-
-        data_str = linha[0].strip()
-        tipo_operacao = linha[1].strip().upper()
-        ticker = linha[2].strip().upper()
-
-        if tipo_operacao != "COMPRA":
-            print(f"DEBUG - Linha ignorada (tipo='{tipo_operacao}'): {linha}")  # 👈 debug temporário
-            continue
-
-        try:
-            data = datetime.strptime(data_str, "%d/%m/%Y")
-        except ValueError:
-            print(f"DEBUG - Data inválida ignorada: {linha}")  # 👈 debug temporário
-            continue
-
-        if ticker not in datas_compra or data < datas_compra[ticker]:
-            datas_compra[ticker] = data
-
-    return datas_compra
-
+def carregar_datas_compra(service) -> dict[str, datetime]:
     """
-    Lê a aba MOVIMENTAÇÕES e retorna um dict:
-    { 'TICKER': data_compra_mais_antiga (datetime) }
-    Considera APENAS linhas cujo tipo de operação seja 'Compra'.
+    Lê MOVIMENTAÇÕES e retorna { 'TICKER': data_inicio_posicao_atual },
+    rastreando saldo (Compra soma / Venda subtrai) para achar quando a
+    posição ATUAL foi aberta (saldo saiu de 0 para positivo).
     """
     result = service.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=MOVIMENTACAO_RANGE
-    ).execute()
-    linhas = result.get("values", [])
-
-    datas_compra = {}
-
-    for linha in linhas:
-        if len(linha) < 3:
-            continue
-
-        data_str = linha[0].strip()
-        tipo_operacao = linha[1].strip().upper()
-        ticker = linha[2].strip().upper()
-
-        # Só considera linhas de COMPRA para definir a data de início
-        if tipo_operacao != "COMPRA":
-            continue
-
-        try:
-            data = datetime.strptime(data_str, "%d/%m/%Y")
-        except ValueError:
-            continue
-
-        if ticker not in datas_compra or data < datas_compra[ticker]:
-            datas_compra[ticker] = data
-
-    return datas_compra
-
-    """
-    Lê a aba MOVIMENTAÇÕES e retorna um dict:
-    { 'TICKER': data_compra_mais_antiga (datetime) }
-    """
-    result = service.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=MOVIMENTACAO_RANGE
-    ).execute()
-    linhas = result.get("values", [])
-
-    datas_compra = {}
-
-    for linha in linhas:
-        if len(linha) < 3:
-            continue
-
-        data_str = linha[0].strip()
-        ticker = linha[2].strip().upper()
-
-        try:
-            data = datetime.strptime(data_str, "%d/%m/%Y")
-        except ValueError:
-            continue
-
-        if ticker not in datas_compra or data < datas_compra[ticker]:
-            datas_compra[ticker] = data
-
-    return datas_compra
-
-def carregar_datas_compra(service):
-    """
-    Lê a aba MOVIMENTAÇÕES e retorna um dict:
-    { 'TICKER': data_inicio_posicao_atual (datetime) }
-    """
-    result = service.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=MOVIMENTACAO_RANGE
+        spreadsheetId=SPREADSHEET_ID, range=MOVIMENTACAO_RANGE
     ).execute()
     linhas = result.get("values", [])
 
     movimentos = []
-
     for linha in linhas:
         if len(linha) < 4:
-            continue  # 👈 agora dentro do if, corretamente
+            continue
 
-        data_str = linha[0].strip()
         tipo_operacao = linha[1].strip().upper()
-        ticker = linha[2].strip().upper()
-        qtd_str = linha[3].strip().replace(",", ".")
-
         if tipo_operacao not in ("COMPRA", "VENDA"):
             continue
 
         try:
-            data = datetime.strptime(data_str, "%d/%m/%Y")
-            qtd = float(qtd_str)
+            data = datetime.strptime(linha[0].strip(), "%d/%m/%Y")
+            qtd = float(linha[3].strip().replace(",", "."))
         except ValueError:
             continue
 
-        movimentos.append((data, tipo_operacao, ticker, qtd))
+        movimentos.append((data, tipo_operacao, linha[2].strip().upper(), qtd))
 
     movimentos.sort(key=lambda m: m[0])
 
-    saldo = {}
-    data_inicio_atual = {}
+    saldo: dict[str, float] = {}
+    data_inicio_atual: dict[str, datetime] = {}
 
     for data, tipo, ticker, qtd in movimentos:
         saldo_anterior = saldo.get(ticker, 0)
-        if tipo == "COMPRA":
-            saldo[ticker] = saldo_anterior + qtd
-        else:  # VENDA
-            saldo[ticker] = saldo_anterior - qtd
+        saldo[ticker] = saldo_anterior + qtd if tipo == "COMPRA" else saldo_anterior - qtd
 
         if saldo_anterior <= 0 and saldo[ticker] > 0:
             data_inicio_atual[ticker] = data
 
     return data_inicio_atual
 
-    """
-    Lê a aba MOVIMENTAÇÕES e retorna um dict:
-    { 'TICKER': data_inicio_posicao_atual (datetime) }
 
-    Rastreia o saldo (Compra soma, Venda subtrai) em ordem cronológica.
-    Sempre que o saldo sai de 0 para > 0, marca essa data como o início
-    da posição ATUAL. Se o ativo for zerado e comprado de novo depois,
-    a data considerada é da compra MAIS RECENTE que reabriu a posição
-    (não da primeira compra histórica).
-    """
-    result = service.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=MOVIMENTACAO_RANGE
-    ).execute()
-    linhas = result.get("values", [])
-
-    movimentos = []
-
-    for linha in linhas:
-        if len(linha) < 4:
-            print(f"DEBUG - Linha SEM qtd (HGLG11?): {linha}")
-        continue
-
-        data_str = linha[0].strip()
-        tipo_operacao = linha[1].strip().upper()
-        ticker = linha[2].strip().upper()
-        qtd_str = linha[3].strip().replace(",", ".")
-
-        if tipo_operacao not in ("COMPRA", "VENDA"):
-            continue
-
-        try:
-            data = datetime.strptime(data_str, "%d/%m/%Y")
-            qtd = float(qtd_str)
-        except ValueError:
-            print(f"DEBUG - Data/Qtd inválida: {linha}")
-            continue
-
-        movimentos.append((data, tipo_operacao, ticker, qtd))
-
-    movimentos.sort(key=lambda m: m[0])
-
-    saldo = {}
-    data_inicio_atual = {}
-
-    for data, tipo, ticker, qtd in movimentos:
-        saldo_anterior = saldo.get(ticker, 0)
-        if tipo == "COMPRA":
-            saldo[ticker] = saldo_anterior + qtd
-        else:
-            saldo[ticker] = saldo_anterior - qtd
-
-        if saldo_anterior <= 0 and saldo[ticker] > 0:
-            data_inicio_atual[ticker] = data
-            if ticker == "HGLG11":
-                print(f"DEBUG - HGLG11 reabriu posição em {data.strftime('%d/%m/%Y')}")  # 👈
-
-    return data_inicio_atual
-
-
-def filtrar_proventos_por_data_compra(proventos, datas_compra):
-    """Remove proventos cuja data_com seja anterior à primeira data de compra do ativo."""
-    proventos_validos = []
+def filtrar_proventos_por_data_compra(
+    proventos: list[Provento], datas_compra: dict[str, datetime]
+) -> list[Provento]:
+    validos = []
 
     for p in proventos:
-        ticker = p["ativo"].strip().upper()
-        data_compra = datas_compra.get(ticker)
-
+        data_compra = datas_compra.get(p.ativo)
         if data_compra is None:
-            proventos_validos.append(p)
+            validos.append(p)
             continue
 
         try:
-            data_com = datetime.strptime(p["data_com"], "%d/%m/%Y")
+            data_com = datetime.strptime(p.data_com, "%d/%m/%Y")
         except ValueError:
-            proventos_validos.append(p)
+            validos.append(p)
             continue
 
         if data_com >= data_compra:
-            proventos_validos.append(p)
+            validos.append(p)
         else:
-            print(
-                f"IGNORADO: {ticker} - data_com {p['data_com']} "
-                f"anterior à compra ({data_compra.strftime('%d/%m/%Y')})"
+            log.info(
+                "IGNORADO: %s - data_com %s anterior à compra (%s)",
+                p.ativo, p.data_com, data_compra.strftime("%d/%m/%Y"),
             )
 
-    return proventos_validos
+    return validos
 
 
-def obter_sheet_id(service, nome_aba):
-    """Retorna o sheetId (gid) de uma aba pelo nome."""
+def obter_sheet_id(service, nome_aba: str) -> Optional[int]:
     metadata = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
     for aba in metadata["sheets"]:
         if aba["properties"]["title"] == nome_aba:
@@ -464,182 +283,119 @@ def obter_sheet_id(service, nome_aba):
     return None
 
 
-def escrever_proventos(service, proventos):
+def escrever_proventos(service, proventos: list[Provento]) -> None:
     """Insere os novos proventos na linha 5, empurrando os demais para baixo."""
     if not proventos:
-        print("Nenhum lançamento novo para adicionar.")
+        log.info("Nenhum lançamento novo para adicionar.")
         return
 
-    valores = [
-        [
-            p["data_com"],
-            p["data_pagamento"],
-            p["ativo"],
-            normalizar_valor(p["valor"]),
-            p["descricao"],
-            p["tipo"]
-        ]
-        for p in proventos
-    ]
-
-    qtd = len(valores)
-
+    qtd = len(proventos)
     sheet_id = obter_sheet_id(service, NOME_ABA_LANCAMENTOS)
     if sheet_id is None:
-        print(f"ERRO: aba '{NOME_ABA_LANCAMENTOS}' não encontrada.")
+        log.error("Aba '%s' não encontrada.", NOME_ABA_LANCAMENTOS)
         return
 
-    requests = [{
-        "insertDimension": {
-            "range": {
-                "sheetId": sheet_id,
-                "dimension": "ROWS",
-                "startIndex": 4,
-                "endIndex": 4 + qtd
-            },
-            "inheritFromBefore": False
-        }
-    }]
-
+    # Insere linhas vazias antes de escrever (evita sobrescrever dados existentes)
     service.spreadsheets().batchUpdate(
         spreadsheetId=SPREADSHEET_ID,
-        body={"requests": requests}
-    ).execute()
-
-    range_escrita = f"{NOME_ABA_LANCAMENTOS}!A5:F{4 + qtd}"
-
-    resultado = service.spreadsheets().values().update(
-        spreadsheetId=SPREADSHEET_ID,
-        range=range_escrita,
-        valueInputOption="USER_ENTERED",
-        body={"values": valores}
-    ).execute()
-
-    print(f"{qtd} novo(s) lançamento(s) adicionado(s) na linha 5, empurrando os demais.")
-
-    # 👇 NOVO: escreve valor em dólar na coluna O, só para quem tiver valor_usd
-    dados_batch_usd = []
-    for i, p in enumerate(proventos):
-        if p.get("valor_usd") is not None:
-            linha_atual = 5 + i
-            dados_batch_usd.append({
-                "range": f"{NOME_ABA_LANCAMENTOS}!O{linha_atual}",
-                "values": [[round(p["valor_usd"], 6)]]
-            })
-
-    if dados_batch_usd:
-        service.spreadsheets().values().batchUpdate(
-            spreadsheetId=SPREADSHEET_ID,
-            body={
-                "valueInputOption": "USER_ENTERED",
-                "data": dados_batch_usd
+        body={"requests": [{
+            "insertDimension": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "ROWS",
+                    "startIndex": LINHA_INICIAL_LANCAMENTOS - 1,
+                    "endIndex": LINHA_INICIAL_LANCAMENTOS - 1 + qtd,
+                },
+                "inheritFromBefore": False,
             }
-        ).execute()
-        print(f"{len(dados_batch_usd)} valor(es) em dólar gravado(s) na coluna O.")
-
-    """Insere os novos proventos na linha 5, empurrando os demais para baixo."""
-    if not proventos:
-        print("Nenhum lançamento novo para adicionar.")
-        return
+        }]},
+    ).execute()
 
     valores = [
-        [
-            p["data_com"],
-            p["data_pagamento"],
-            p["ativo"],
-            normalizar_valor(p["valor"]),
-            p["descricao"],
-            p["tipo"]
-        ]
+        [p.data_com, p.data_pagamento, p.ativo, p.valor_float, p.descricao, p.tipo]
         for p in proventos
     ]
 
-    qtd = len(valores)
+    linha_final = LINHA_INICIAL_LANCAMENTOS - 1 + qtd
+    service.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{NOME_ABA_LANCAMENTOS}!A{LINHA_INICIAL_LANCAMENTOS}:F{linha_final}",
+        valueInputOption="USER_ENTERED",
+        body={"values": valores},
+    ).execute()
 
-    print("DEBUG - Valores a inserir:")
-    for v in valores:
-        print("  ", v)
+    log.info("%d novo(s) lançamento(s) adicionado(s) na linha %d, empurrando os demais.",
+              qtd, LINHA_INICIAL_LANCAMENTOS)
 
-    sheet_id = obter_sheet_id(service, NOME_ABA_LANCAMENTOS)
-    if sheet_id is None:
-        print(f"ERRO: aba '{NOME_ABA_LANCAMENTOS}' não encontrada.")
+    _gravar_valores_usd(service, proventos, linha_inicial=LINHA_INICIAL_LANCAMENTOS)
+
+
+def _gravar_valores_usd(service, proventos: list[Provento], linha_inicial: int) -> None:
+    """Escreve o valor original em dólar na coluna O, só para quem tiver valor_usd."""
+    dados_batch = [
+        {
+            "range": f"{NOME_ABA_LANCAMENTOS}!{COLUNA_VALOR_USD}{linha_inicial + i}",
+            "values": [[round(p.valor_usd, 6)]],
+        }
+        for i, p in enumerate(proventos)
+        if p.valor_usd is not None
+    ]
+
+    if not dados_batch:
         return
 
-    requests = [{
-        "insertDimension": {
-            "range": {
-                "sheetId": sheet_id,
-                "dimension": "ROWS",
-                "startIndex": 4,
-                "endIndex": 4 + qtd
-            },
-            "inheritFromBefore": False
-        }
-    }]
-
-    service.spreadsheets().batchUpdate(
+    service.spreadsheets().values().batchUpdate(
         spreadsheetId=SPREADSHEET_ID,
-        body={"requests": requests}
+        body={"valueInputOption": "USER_ENTERED", "data": dados_batch},
     ).execute()
-
-    range_escrita = f"{NOME_ABA_LANCAMENTOS}!A5:F{4 + qtd}"
-
-    resultado = service.spreadsheets().values().update(
-        spreadsheetId=SPREADSHEET_ID,
-        range=range_escrita,
-        valueInputOption="USER_ENTERED",
-        body={"values": valores}
-    ).execute()
-
-    print(f"DEBUG - updatedRange: {resultado.get('updatedRange')}")
-    print(f"DEBUG - updatedRows: {resultado.get('updatedRows')}")
-    print(f"{qtd} novo(s) lançamento(s) adicionado(s) na linha 5, empurrando os demais.")
+    log.info("%d valor(es) em dólar gravado(s) na coluna %s.", len(dados_batch), COLUNA_VALOR_USD)
 
 
-def main():
+def main() -> None:
     creds = autenticar_service_account()
 
     try:
         service = build("sheets", "v4", credentials=creds)
 
         tickers = ler_tickers(service)
-        print(f"Tickers na carteira: {tickers}")
-
+        log.info("Tickers na carteira: %s", tickers)
         if not tickers:
-            print("Nenhum ticker encontrado na aba CARTEIRA.")
+            log.warning("Nenhum ticker encontrado na aba CARTEIRA.")
             return
 
-        proventos = buscar_proventos(tickers)
-        print(f"\nTotal de proventos encontrados: {len(proventos)}")
-
-        if not proventos:
-            print("Nenhum provento retornado pelo scraper.")
+        proventos_raw = buscar_proventos(tickers)
+        log.info("Total de proventos encontrados: %d", len(proventos_raw))
+        if not proventos_raw:
+            log.warning("Nenhum provento retornado pelo scraper.")
             return
+
+        proventos = [Provento.from_dict(p) for p in proventos_raw]
 
         existentes = ler_lancamentos_existentes(service)
-
         novos, atualizacoes = separar_novos_e_atualizacoes(proventos, existentes)
-        print(f"Novos lançamentos a inserir: {len(novos)}")
-        print(f"Lançamentos a corrigir (valor alterado): {len(atualizacoes)}")
+
+        log.info("Novos lançamentos a inserir: %d", len(novos))
+        log.info("Lançamentos a corrigir (valor alterado): %d", len(atualizacoes))
 
         aplicar_atualizacoes(service, atualizacoes)
 
         if not novos:
-            print("Nenhum lançamento novo para adicionar.")
             return
 
         datas_compra = carregar_datas_compra(service)
         validos = filtrar_proventos_por_data_compra(novos, datas_compra)
-        print(f"Lançamentos válidos após conferência de data de compra: {len(validos)}")
+        log.info("Lançamentos válidos após conferência de data de compra: %d", len(validos))
 
         if not validos:
-            print("Nenhum lançamento válido para adicionar após filtro de data de compra.")
+            log.info("Nenhum lançamento válido para adicionar após filtro de data de compra.")
             return
 
         escrever_proventos(service, validos)
 
     except HttpError as err:
-        print(err)
+        log.error("Erro na API do Google Sheets: %s", err)
+    except Exception:
+        log.exception("Erro inesperado na execução do script.")
 
 
 if __name__ == "__main__":
