@@ -1,12 +1,12 @@
 """
 buscarDividendos.py
-Orquestra: leitura de carteira -> scraping de proventos -> diff contra
-lançamentos existentes -> atualização/inserção no Google Sheets.
+Orquestra: leitura de carteira -> scraping de proventos -> conversão USD->BRL
+-> diff contra lançamentos existentes -> atualização/inserção no Google Sheets.
 """
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
@@ -23,6 +23,7 @@ from config import (
     TICKERS_IGNORADOS,
 )
 from scraper import buscar_proventos, normalizar_data
+from cotacoes import obter_cotacao_dolar
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,7 +35,6 @@ log = logging.getLogger(__name__)
 LINHA_INICIAL_LANCAMENTOS = 5
 COLUNA_VALOR = "D"
 COLUNA_VALOR_USD = "O"
-COLUNAS_ESCRITA = "A:F"  # data_com, data_pagamento, ativo, valor, descricao, tipo
 
 
 @dataclass
@@ -67,6 +67,11 @@ class Provento:
     @property
     def valor_float(self) -> Optional[float]:
         return normalizar_valor(self.valor)
+
+    def converter_para_brl(self, cotacao: float) -> None:
+        """Se houver valor_usd, converte e sobrescreve 'valor' (coluna D) em reais."""
+        if self.valor_usd is not None:
+            self.valor = str(round(float(self.valor_usd) * cotacao, 4))
 
 
 @dataclass
@@ -161,10 +166,6 @@ def separar_novos_e_atualizacoes(
             ))
 
     return novos, atualizacoes
-
-
-def _monta_range_usd(linha: int) -> dict:
-    return {"range": f"{NOME_ABA_LANCAMENTOS}!{COLUNA_VALOR_USD}{linha}", "values": [[None]]}
 
 
 def aplicar_atualizacoes(service, atualizacoes: list[Atualizacao]) -> None:
@@ -370,6 +371,12 @@ def main() -> None:
             return
 
         proventos = [Provento.from_dict(p) for p in proventos_raw]
+
+        # Converte valores em USD -> BRL uma única vez (evita chamadas repetidas à API de cotação)
+        cotacao_dolar = obter_cotacao_dolar()
+        log.info("Cotação USD/BRL utilizada: %s", cotacao_dolar)
+        for p in proventos:
+            p.converter_para_brl(cotacao_dolar)
 
         existentes = ler_lancamentos_existentes(service)
         novos, atualizacoes = separar_novos_e_atualizacoes(proventos, existentes)
