@@ -6,6 +6,7 @@ Orquestra: leitura de carteira -> scraping de proventos -> conversão USD->BRL
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -35,6 +36,15 @@ LINHA_INICIAL_LANCAMENTOS = 5
 COLUNA_VALOR = "D"
 COLUNA_VALOR_USD = "O"
 
+# ===================== HELPERS =====================
+_SUFIXOS_BR = re.compile(r"(3|4|5|6|11)$")  # ON, PN, UNT, FII etc (B3)
+
+
+def _e_ativo_americano(ticker: str) -> bool:
+    """Fallback de segurança: tickers B3 terminam em número (3,4,5,6,11)."""
+    ticker = ticker.strip().upper()
+    return not bool(_SUFIXOS_BR.search(ticker))
+
 
 @dataclass
 class Provento:
@@ -49,14 +59,23 @@ class Provento:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Provento":
+        ativo = d.get("ativo", "").strip().upper()
+        valor_bruto = d.get("valor", "")
+        valor_usd = d.get("valor_usd")
+
+        # Fallback: se o scraper não separou valor_usd mas o ativo é americano,
+        # assume que "valor" já vem em USD e precisa ser convertido.
+        if valor_usd is None and _e_ativo_americano(ativo):
+            valor_usd = normalizar_valor(valor_bruto)
+
         return cls(
             data_com=normalizar_data(d.get("data_com", "")) or d.get("data_com", ""),
             data_pagamento=normalizar_data(d.get("data_pagamento", "")) or d.get("data_pagamento", ""),
-            ativo=d.get("ativo", "").strip().upper(),
-            valor=d.get("valor", ""),
+            ativo=ativo,
+            valor=valor_bruto,
             descricao=d.get("descricao", "").strip(),
             tipo=d.get("tipo", "").strip(),
-            valor_usd=d.get("valor_usd"),
+            valor_usd=valor_usd,
         )
 
     @property
@@ -363,7 +382,7 @@ def main() -> None:
             log.warning("Nenhum ticker encontrado na aba CARTEIRA.")
             return
 
-        proventos_raw = buscar_proventos(tickers)
+        proventos_raw, cotacao_dolar_scraper = buscar_proventos(tickers)
         log.info("Total de proventos encontrados: %d", len(proventos_raw))
         if not proventos_raw:
             log.warning("Nenhum provento retornado pelo scraper.")
@@ -371,11 +390,19 @@ def main() -> None:
 
         proventos = [Provento.from_dict(p) for p in proventos_raw]
 
-        # Converte valores em USD -> BRL uma única vez (evita chamadas repetidas à API de cotação)
-        cotacao_dolar = obter_cotacao_dolar()
+        # Reaproveita a cotação já obtida dentro do scraper (evita 2ª chamada à API,
+        # reduzindo risco de rate-limit/429).
+        cotacao_dolar = obter_cotacao_dolar(cotacao_existente=cotacao_dolar_scraper)
         log.info("Cotação USD/BRL utilizada: %s", cotacao_dolar)
-        for p in proventos:
-            p.converter_para_brl(cotacao_dolar)
+
+        if cotacao_dolar is None:
+            log.error(
+                "Cotação USD/BRL indisponível (API e cache falharam) — "
+                "proventos em dólar NÃO serão convertidos nesta execução."
+            )
+        else:
+            for p in proventos:
+                p.converter_para_brl(cotacao_dolar)
 
         existentes = ler_lancamentos_existentes(service)
         novos, atualizacoes = separar_novos_e_atualizacoes(proventos, existentes)

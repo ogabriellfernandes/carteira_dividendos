@@ -1,14 +1,16 @@
 """
 scraper.py
 Coleta proventos (dividendos/rendimentos) do Investidor10 para uma lista
-de tickers (Ações, FIIs e ETFs Globais), com conversão USD -> BRL quando
-aplicável.
+de tickers (Ações, FIIs e ETFs Globais). Ativos estrangeiros (não-B3)
+retornam o valor original em USD (`valor_usd`) sem conversão — a conversão
+para BRL é responsabilidade exclusiva de `buscarDividendos.py`.
 """
 from __future__ import annotations
 
 import json
 import logging
 import random
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -49,6 +51,8 @@ FORMATOS_DATA = ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"]
 COTACAO_URL = "https://economia.awesomeapi.com.br/last/USD-BRL"
 BASE_URL = "https://investidor10.com.br"
 
+_PADRAO_TICKER_B3 = re.compile(r"\d{1,2}$")  # PETR4, BTLG11, HGLG11...
+
 # ===================== CACHE DE COTAÇÃO =====================
 CACHE_COTACAO_PATH = Path("cotacao_cache.json")
 CACHE_COTACAO_TTL_HORAS = 12
@@ -75,6 +79,11 @@ class ProventoBruto:
             "tipo": self.tipo,
             "valor_usd": self.valor_usd,
         }
+
+
+def _e_ticker_b3(ticker: str) -> bool:
+    """Tickers da B3 terminam em número (ON=3, PN=4, UNT=11, FII=11...)."""
+    return bool(_PADRAO_TICKER_B3.search(ticker.strip().upper()))
 
 
 def _criar_sessao() -> requests.Session:
@@ -155,10 +164,13 @@ def _buscar_pagina(
     return None, None
 
 
-def _extrair_proventos(
-    html: str, ticker: str, tipo: str, cotacao_usd: Optional[float] = None
-) -> list[ProventoBruto]:
-    """Faz o parsing da tabela de histórico de dividendos do Investidor10."""
+def _extrair_proventos(html: str, ticker: str, tipo: str) -> list[ProventoBruto]:
+    """
+    Faz o parsing da tabela de histórico de dividendos do Investidor10.
+    Para ativos não-B3 (ações US, ETFs globais etc.), preenche `valor_usd`
+    com o valor original em dólar, SEM converter — conversão é feita
+    depois, uma única vez, em `buscarDividendos.py`.
+    """
     soup = BeautifulSoup(html, "html.parser")
     tabela = soup.find("table", {"id": "table-dividends-history"})
 
@@ -192,11 +204,12 @@ def _extrair_proventos(
 
         valor_usd_original = None
 
-        if tipo == "ETF Global" and cotacao_usd:
+        if not _e_ticker_b3(ticker):
+            # Ativo estrangeiro -> valor extraído já é em USD; guarda puro.
             valor_num = normalizar_valor_usd(valor)
             if valor_num is not None:
                 valor_usd_original = valor_num
-                valor = str(round(valor_num * cotacao_usd, 4))
+                valor = str(valor_num)  # mantém consistência de formato (ponto decimal)
 
         proventos.append(ProventoBruto(
             data_com=data_com,
@@ -292,7 +305,7 @@ def buscar_proventos(
     if cotacao_usd:
         log.info("Cotação USD/BRL utilizada: R$ %.4f", cotacao_usd)
     else:
-        log.warning("Cotação USD/BRL indisponível — valores de ETFs globais ficarão em dólar.")
+        log.warning("Cotação USD/BRL indisponível — valores em dólar ficarão pendentes de conversão.")
 
     total = len(tickers)
 
@@ -306,7 +319,7 @@ def buscar_proventos(
                 log.warning("Ativo '%s' não encontrado no Investidor10.", ticker)
                 continue
 
-            proventos = _extrair_proventos(html, ticker, tipo, cotacao_usd)
+            proventos = _extrair_proventos(html, ticker, tipo)
 
             proventos_filtrados = []
             for p in proventos:
@@ -334,7 +347,7 @@ def buscar_proventos(
 
 if __name__ == "__main__":
     # Teste rápido isolado, sem depender do Google Sheets
-    proventos, cotacao = buscar_proventos(["btlg11", "petr4"])
+    proventos, cotacao = buscar_proventos(["btlg11", "petr4", "aapl"])
     for d in proventos:
         print(d)
     print(f"Cotação usada: {cotacao}")
