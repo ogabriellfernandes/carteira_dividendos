@@ -6,11 +6,13 @@ aplicável.
 """
 from __future__ import annotations
 
+import json
 import logging
 import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
 import requests
@@ -46,6 +48,10 @@ CATEGORIAS = [
 FORMATOS_DATA = ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"]
 COTACAO_URL = "https://economia.awesomeapi.com.br/last/USD-BRL"
 BASE_URL = "https://investidor10.com.br"
+
+# ===================== CACHE DE COTAÇÃO =====================
+CACHE_COTACAO_PATH = Path("cotacao_cache.json")
+CACHE_COTACAO_TTL_HORAS = 12
 
 
 @dataclass
@@ -205,21 +211,64 @@ def _extrair_proventos(
     return proventos
 
 
+# ===================== COTAÇÃO USD/BRL (com cache/fallback) =====================
+
+def _ler_cache_cotacao() -> Optional[float]:
+    """Lê cotação salva em cache, se ainda válida (dentro do TTL)."""
+    if not CACHE_COTACAO_PATH.exists():
+        return None
+    try:
+        dados = json.loads(CACHE_COTACAO_PATH.read_text(encoding="utf-8"))
+        salvo_em = datetime.fromisoformat(dados["salvo_em"])
+        if datetime.now() - salvo_em > timedelta(hours=CACHE_COTACAO_TTL_HORAS):
+            return None
+        return float(dados["valor"])
+    except Exception as e:
+        log.warning("Cache de cotação inválido/corrompido: %s", e)
+        return None
+
+
+def _salvar_cache_cotacao(valor: float) -> None:
+    """Persiste a cotação obtida com sucesso, para uso como fallback futuro."""
+    try:
+        CACHE_COTACAO_PATH.write_text(
+            json.dumps({"valor": valor, "salvo_em": datetime.now().isoformat()}),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        log.warning("Falha ao salvar cache de cotação: %s", e)
+
+
 def _buscar_cotacao_usd_brl(sessao: requests.Session) -> Optional[float]:
-    """Busca a cotação atual USD -> BRL via AwesomeAPI (gratuita, sem chave)."""
+    """
+    Busca a cotação atual USD -> BRL via AwesomeAPI (gratuita, sem chave).
+    Em caso de falha (ex: 429), usa cache local recente como fallback.
+    """
     try:
         resp = sessao.get(COTACAO_URL, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
         resp.raise_for_status()
-        return float(resp.json()["USDBRL"]["bid"])
+        valor = float(resp.json()["USDBRL"]["bid"])
+        _salvar_cache_cotacao(valor)
+        return valor
     except Exception as e:
         log.error("Falha ao buscar cotação USD/BRL: %s", e)
+        cache = _ler_cache_cotacao()
+        if cache:
+            log.warning("Usando cotação em cache (R$ %.4f) como fallback.", cache)
+            return cache
         return None
 
-def obter_cotacao_dolar() -> Optional[float]:
+
+def obter_cotacao_dolar(cotacao_existente: Optional[float] = None) -> Optional[float]:
     """
-    Wrapper público: cria sua própria sessão HTTP e retorna a cotação
-    USD -> BRL. Usado externamente (ex: buscarDividendos.py).
+    Wrapper público de cotação USD -> BRL.
+    Se `cotacao_existente` for fornecida (já obtida em outro ponto do fluxo,
+    ex: dentro de `buscar_proventos`), apenas a retorna — evitando uma
+    segunda requisição à API e reduzindo risco de 429.
     """
+    if cotacao_existente is not None:
+        return cotacao_existente
+
     sessao = _criar_sessao()
     try:
         return _buscar_cotacao_usd_brl(sessao)
@@ -227,10 +276,11 @@ def obter_cotacao_dolar() -> Optional[float]:
         sessao.close()
 
 
-def buscar_proventos(tickers: list[str], meses_retroativos: int = 6) -> list[dict]:
+def buscar_proventos(
+    tickers: list[str], meses_retroativos: int = 6
+) -> tuple[list[dict], Optional[float]]:
     """
-    Recebe lista de tickers e retorna proventos recentes/futuros (como list[dict],
-    para manter compatibilidade com o consumidor em buscarDividendos.py).
+    Recebe lista de tickers e retorna (proventos, cotacao_usd_utilizada).
     Reutiliza uma única sessão HTTP e aplica delay entre requisições
     para reduzir risco de bloqueio pelo site.
     """
@@ -279,10 +329,12 @@ def buscar_proventos(tickers: list[str], meses_retroativos: int = 6) -> list[dic
     finally:
         sessao.close()
 
-    return resultado
+    return resultado, cotacao_usd
 
 
 if __name__ == "__main__":
     # Teste rápido isolado, sem depender do Google Sheets
-    for d in buscar_proventos(["btlg11", "petr4"]):
+    proventos, cotacao = buscar_proventos(["btlg11", "petr4"])
+    for d in proventos:
         print(d)
+    print(f"Cotação usada: {cotacao}")

@@ -23,7 +23,6 @@ from config import (
     TICKERS_IGNORADOS,
 )
 from scraper import buscar_proventos, normalizar_data
-from scraper import obter_cotacao_dolar
 
 logging.basicConfig(
     level=logging.INFO,
