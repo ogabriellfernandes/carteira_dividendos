@@ -22,7 +22,7 @@ from config import (
     NOME_ABA_LANCAMENTOS,
     TICKERS_IGNORADOS,
 )
-from scraper import buscar_proventos, normalizar_data
+from scraper import buscar_proventos, normalizar_data, obter_cotacao_dolar
 
 logging.basicConfig(
     level=logging.INFO,
