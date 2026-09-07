@@ -23,7 +23,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Criar service_account.json a partir do Secret
-        run: echo '${{ secrets.SERVICE_ACCOUNT_JSON }}' > service_account.json
+        run: echo '${{ secrets.SERVICE_ACCOUNT_JSON }}' | base64 -d > service_account.json
 
       - name: Executar script de dividendos
         env:
