@@ -215,6 +215,17 @@ def _buscar_cotacao_usd_brl(sessao: requests.Session) -> Optional[float]:
         log.error("Falha ao buscar cotação USD/BRL: %s", e)
         return None
 
+def obter_cotacao_dolar() -> Optional[float]:
+    """
+    Wrapper público: cria sua própria sessão HTTP e retorna a cotação
+    USD -> BRL. Usado externamente (ex: buscarDividendos.py).
+    """
+    sessao = _criar_sessao()
+    try:
+        return _buscar_cotacao_usd_brl(sessao)
+    finally:
+        sessao.close()
+
 
 def buscar_proventos(tickers: list[str], meses_retroativos: int = 6) -> list[dict]:
     """
