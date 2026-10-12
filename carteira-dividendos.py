@@ -1,7 +1,6 @@
 """
 buscarDividendos.py
 Orquestra: leitura de carteira -> scraping de proventos -> conversão USD->BRL
--> diff contra lançamentos existentes -> atualização/inserção no Google Sheets.
 """
 from __future__ import annotations
 
